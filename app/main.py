@@ -17,9 +17,10 @@ from __future__ import annotations
 import math
 import sqlite3
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, Iterator
 
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -43,6 +44,7 @@ from .schemas import (
     PolicyVersionOut,
     QuotaPlanIn,
     QuotaPlanOut,
+    QuotaUsageOut,
     ReservationIn,
     ReservationOut,
     ReservationSettleIn,
@@ -79,11 +81,15 @@ app = FastAPI(
         "POST /quota-plans 在只读快照上为 1～18 个待执行请求规划配额内总收益最大的"
         "子集：同一时刻按现行策略补充各命中桶（未建桶按满额），不推进定时变更与"
         "预占状态，精确求最优（总收益最大、项数更多、升序 ID 字典序更小），全程只读。"
+        "GET /quota-usage 在同一只读快照内按 UTC 左闭右开窗口（裁决时间或预占创建"
+        "时间筛选）按 tenant_id、route_id 汇总已消耗量（获准未撤销裁决、confirmed/"
+        "settled 预占）与未完成占用量（报表时刻尚未到期的 pending 预占；到期未清扫"
+        "也按到期处理），不修改预占或桶。"
         "管理写接口（策略新增/更新、回滚、定时变更创建/取消）需要"
         " HMAC-SHA256 防重放签名（X-Key-Id/X-Timestamp/X-Nonce/X-Signature）；"
-        "GET、裁决（含批量）、预演、撤销、预占与配额规划接口无需认证。"
+        "GET、裁决（含批量）、预演、撤销、预占、配额规划与配额消耗核对接口无需认证。"
     ),
-    version="1.9.0",
+    version="1.10.0",
     lifespan=lifespan,
 )
 
@@ -106,6 +112,27 @@ def _sanitize_jsonable(obj: Any) -> Any:
     if isinstance(obj, (list, tuple)):
         return [_sanitize_jsonable(v) for v in obj]
     return obj
+
+
+def _parse_utc_window_param(name: str, raw: str) -> datetime:
+    """把查询参数解析为显式带时区的 UTC 时刻。
+
+    时间格式无效（无法按 ISO 8601 解析）或不带时区（无法可靠解释为 UTC）
+    一律返回 422 校验错误。
+    """
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(
+            422,
+            f"查询参数 {name} 不是合法的 ISO 8601 UTC 时间"
+            "（例如 2026-09-27T12:00:00Z）",
+        )
+    if dt.tzinfo is None:
+        raise HTTPException(
+            422, f"查询参数 {name} 必须显式带时区（UTC，例如 ...T12:00:00Z）"
+        )
+    return dt.astimezone(timezone.utc)
 
 
 @app.exception_handler(RequestValidationError)
@@ -612,3 +639,50 @@ def post_quota_plan(
         return quota.plan_quota(
             conn, items=[item.model_dump() for item in body.items]
         )
+
+
+# ------------------------------------------------------------ 配额消耗核对（只读）
+
+
+@app.get(
+    "/quota-usage",
+    response_model=QuotaUsageOut,
+    tags=["配额消耗核对"],
+    responses={
+        422: {"description": "start/end 时间格式无效（非 ISO 8601 或不带时区），或起点不早于终点"},
+    },
+)
+def get_quota_usage(
+    start: str = Query(
+        ...,
+        description="统计窗口起点（UTC，左闭），ISO 8601 显式带时区，如 2026-09-27T12:00:00Z",
+    ),
+    end: str = Query(
+        ...,
+        description="统计窗口终点（UTC，右开），ISO 8601 显式带时区，必须晚于 start",
+    ),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict:
+    """按租户与路由核对配额请求的实际消耗（免认证、全程只读）。
+
+    输入 UTC 左闭右开窗口 [start, end)：裁决按 decided_at、预占按 created_at
+    筛选。在**同一只读快照**内按 tenant_id、route_id 汇总：
+
+    - 已消耗量 `consumed`：获准且未撤销的单笔及成功批次裁决 cost；
+      `confirmed` 预占按预占量 cost、`settled` 预占按 actual_cost；
+    - 未完成占用量 `held`：报表快照时刻仍未到期的 `pending` 预占 cost
+      （到期但尚未惰性清扫的 pending 也按到期处理，不计入）；
+    - 被拒绝或已撤销的裁决、`rejected` / `cancelled` / `expired` 预占均不计入；
+      重放不产生新行、批次内各笔以自身 request_id 存档，故不重复计量。
+
+    查询只执行 SELECT：不推进预占到期状态，也不修改任何预占或桶。
+    无匹配记录时 `groups` 为空列表。时间格式无效或 start >= end 返回 422。
+    """
+    start_dt = _parse_utc_window_param("start", start)
+    end_dt = _parse_utc_window_param("end", end)
+    if not start_dt < end_dt:
+        raise HTTPException(
+            422, "时间窗口非法：start 必须严格早于 end（左闭右开 [start, end)）"
+        )
+    with read_tx(conn):
+        return quota.quota_usage(conn, start=start_dt, end=end_dt)

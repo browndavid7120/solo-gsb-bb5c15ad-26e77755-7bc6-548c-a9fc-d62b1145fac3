@@ -2553,3 +2553,161 @@ def settle_reservation(
         (reservation_id,),
     ).fetchone()
     return _reservation_out(conn, row, replayed=False, now=ts)
+
+
+# ------------------------------------------------------------ 配额消耗核对（只读）
+
+
+def _canonical_window_iso(dt: datetime) -> str:
+    """把窗口边界格式化为与库内存储完全一致的规范 ISO 8601 UTC 文本，
+    使 decided_at / created_at 这类文本时间戳可以直接做字典序比较
+    （始终带 6 位微秒 + Z，避免无小数秒时 'Z' 与 '.' 的排序差异）。"""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
+def quota_usage(
+    conn: sqlite3.Connection,
+    *,
+    start: datetime,
+    end: datetime,
+) -> dict[str, Any]:
+    """在同一只读快照内按 tenant_id、route_id 汇总窗口内的已消耗量与
+    未完成占用量。调用方必须在 database.read_tx 只读快照事务内调用：
+    全程只做 SELECT，绝不推进预占到期状态、绝不改动预占或桶。
+
+    窗口为左闭右开 [start, end)：
+      - 裁决按 decided_at 筛选；预占按 created_at 筛选；
+      - 到期但尚未惰性清扫的 pending 预占按到期处理（与是否已转 expired 无关，
+        只看 expire_at 与报表快照时刻 evaluated_at 的先后），故不计入占用。
+
+    计量规则：
+      - 获准（allowed=1）且未撤销（revoked=0）的单笔及成功批次裁决：
+        以 cost 计入已消耗；被拒绝或已撤销的裁决不计入。重放不产生新行，
+        批次内每笔裁决各自以 request_id 存档，因此两者天然不会重复计量；
+      - confirmed 预占按预占量 cost 计入已消耗；
+      - settled 预占按实际用量 actual_cost 计入已消耗；
+      - 报表时刻仍未到期的 pending 预占按预占量 cost 计入未完成占用量；
+      - rejected / cancelled / expired 预占，以及已到期（expire_at 不晚于
+        报表时刻）的 pending 预占，均不计入任何一项。
+
+    无匹配记录时 groups 为空列表。
+    """
+    start_iso = _canonical_window_iso(start)
+    end_iso = _canonical_window_iso(end)
+    evaluated_at = now_utc()
+    evaluated_iso = iso(evaluated_at)
+
+    # 同一只读快照内完成全部读取；文本时间戳同为规范 ISO 8601 UTC，
+    # 可直接字典序比较（左闭右开）
+    decision_rows = conn.execute(
+        """
+        SELECT cost, payload_json
+        FROM decisions
+        WHERE allowed = 1 AND revoked = 0
+          AND decided_at >= ? AND decided_at < ?
+        """,
+        (start_iso, end_iso),
+    ).fetchall()
+
+    reservation_rows = conn.execute(
+        """
+        SELECT status, tenant_id, route_id, cost, actual_cost, expire_at
+        FROM reservations
+        WHERE created_at >= ? AND created_at < ?
+        """,
+        (start_iso, end_iso),
+    ).fetchall()
+
+    # 分组键 -> 各类量的累加器；分组键取请求自身携带的 tenant/route
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def _bucket(tenant: str, route: str) -> dict[str, Any]:
+        key = (tenant, route)
+        g = groups.get(key)
+        if g is None:
+            g = {
+                "decisions": 0.0,
+                "confirmed": 0.0,
+                "settled": 0.0,
+                "held": 0.0,
+                "decision_count": 0,
+                "confirmed_count": 0,
+                "settled_count": 0,
+                "pending_count": 0,
+            }
+            groups[key] = g
+        return g
+
+    for row in decision_rows:
+        payload = json.loads(row["payload_json"])
+        tenant = payload.get("tenant_id") or EMPTY
+        route = payload.get("route_id") or EMPTY
+        g = _bucket(tenant, route)
+        g["decisions"] += float(row["cost"])
+        g["decision_count"] += 1
+
+    for row in reservation_rows:
+        status = row["status"]
+        if status not in ("confirmed", "settled", "pending"):
+            # rejected / cancelled / expired 均不计入
+            continue
+        tenant = row["tenant_id"] or EMPTY
+        route = row["route_id"] or EMPTY
+        if status == "confirmed":
+            g = _bucket(tenant, route)
+            g["confirmed"] += float(row["cost"])
+            g["confirmed_count"] += 1
+        elif status == "settled":
+            # 结算行的 actual_cost 在创建时校验为非空非负（可能为 0：
+            # 仍计入分组并由 settled_count 体现，消耗贡献为 0）
+            g = _bucket(tenant, route)
+            g["settled"] += float(row["actual_cost"])
+            g["settled_count"] += 1
+        else:  # pending
+            # 到期但尚未惰性清扫的 pending 也按到期处理（与 expired 同样完全
+            # 不入账、不产生分组）：只与快照时刻比较，不执行任何 UPDATE
+            # （查询不得修改预占或桶）
+            if row["expire_at"] <= evaluated_iso:
+                continue
+            g = _bucket(tenant, route)
+            g["held"] += float(row["cost"])
+            g["pending_count"] += 1
+
+    # 输出顺序：全局（无 tenant）在前；其后按 tenant_id、route_id 升序，
+    # 便于运营核对与分页；同一 tenant 下不带 route 的行排在该租户具体路由前
+    def _sort_key(key: tuple[str, str]) -> tuple[int, str, str]:
+        tenant, route = key
+        return (0 if not tenant else 1, tenant, route)
+
+    out_groups: list[dict[str, Any]] = []
+    total_consumed = 0.0
+    total_held = 0.0
+    for tenant, route in sorted(groups, key=_sort_key):
+        g = groups[(tenant, route)]
+        consumed = math.fsum((g["decisions"], g["confirmed"], g["settled"]))
+        held = g["held"]
+        total_consumed += consumed
+        total_held += held
+        out_groups.append(
+            {
+                "tenant_id": tenant or None,
+                "route_id": route or None,
+                "consumed": float(consumed),
+                "held": float(held),
+                "decision_count": g["decision_count"],
+                "confirmed_count": g["confirmed_count"],
+                "settled_count": g["settled_count"],
+                "pending_count": g["pending_count"],
+            }
+        )
+
+    return {
+        "start": start_iso,
+        "end": end_iso,
+        "evaluated_at": evaluated_iso,
+        "total_consumed": float(total_consumed),
+        "total_held": float(total_held),
+        "groups": out_groups,
+    }

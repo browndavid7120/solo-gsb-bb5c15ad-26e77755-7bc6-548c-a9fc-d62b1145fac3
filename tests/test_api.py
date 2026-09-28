@@ -3193,3 +3193,330 @@ def test_quota_plan_exact_optimum_brute_force_crosscheck(client):
         ("tenant", "t1", None): remaining[("tenant", "t1")],
         ("tenant", "t2", None): remaining[("tenant", "t2")],
     }
+
+
+# ============================================================ 配额消耗核对
+
+
+def _usage(client, start, end):
+    return client.get("/quota-usage", params={"start": start, "end": end})
+
+
+def _db_status(reservation_id):
+    """直接读库（绕过任何惰性清扫）查看预占当前持久化状态。"""
+    from app import database
+
+    conn = database.connect()
+    try:
+        row = conn.execute(
+            "SELECT status FROM reservations WHERE reservation_id=?",
+            (reservation_id,),
+        ).fetchone()
+        return row["status"] if row is not None else None
+    finally:
+        conn.close()
+
+
+def _db_global_balance_raw():
+    """直接读库取全局桶落库余额（不做任何时间补充）。"""
+    from app import database
+
+    conn = database.connect()
+    try:
+        row = conn.execute(
+            "SELECT balance FROM buckets WHERE scope='global'"
+        ).fetchone()
+        return None if row is None else row["balance"]
+    finally:
+        conn.close()
+
+
+def test_usage_decisions_grouped_allowed_only_revoked_excluded(client, clock):
+    put_policy(client, "global", 100, 0)
+    put_policy(client, "tenant", 100, 0, tenant="t1")
+    put_policy(client, "route", 100, 0, tenant="t1", route="/r1")
+
+    client.post("/decide", json={"request_id": "d1", "tenant_id": "t1",
+                                 "route_id": "/r1", "cost": 3})
+    client.post("/decide", json={"request_id": "d2", "tenant_id": "t1", "cost": 1})
+    client.post("/decide", json={"request_id": "d3", "cost": 2})
+    # 被拒绝的裁决不计入
+    r = client.post("/decide", json={"request_id": "d4", "tenant_id": "t1",
+                                     "route_id": "/r1", "cost": 999})
+    assert r.json()["allowed"] is False
+    # 获准后撤销的裁决不计入
+    client.post("/decide/d1/revoke")
+
+    start, end = _iso(clock.t - timedelta(seconds=1)), _iso(clock.t + timedelta(seconds=1))
+    body = _usage(client, start, end).json()
+
+    assert body["evaluated_at"] == _iso(clock.t)
+    # 分组顺序：全局 -> t1 -> (t1, /r1)；(t1, /r1) 无任何计入记录故不出现
+    assert [(g["tenant_id"], g["route_id"]) for g in body["groups"]] == [
+        (None, None), ("t1", None)
+    ]
+    g_global, g_tenant = body["groups"]
+    assert g_global["consumed"] == 2.0 and g_global["decision_count"] == 1
+    assert g_global["held"] == 0.0 and g_global["pending_count"] == 0
+    assert g_tenant["consumed"] == 1.0 and g_tenant["decision_count"] == 1
+    assert body["total_consumed"] == 3.0 and body["total_held"] == 0.0
+    # 窗口边界回显为带微秒的规范 UTC 文本
+    assert body["start"].endswith(".000000Z") and body["end"].endswith(".000000Z")
+
+
+def test_usage_batch_decisions_counted_individually_and_replay_once(client, clock):
+    put_policy(client, "global", 100, 0)
+    client.post("/decide-batches", json={
+        "batch_id": "b1",
+        "requests": [
+            {"request_id": "bd1", "cost": 4},
+            {"request_id": "bd2", "tenant_id": "t1", "cost": 6},
+        ],
+    })
+    # 批次重放不重复计量；单笔重放也不产生新行
+    client.post("/decide-batches", json={
+        "batch_id": "b1",
+        "requests": [
+            {"request_id": "bd1", "cost": 4},
+            {"request_id": "bd2", "tenant_id": "t1", "cost": 6},
+        ],
+    })
+    client.post("/decide", json={"request_id": "bd1", "cost": 4})
+
+    body = _usage(
+        client,
+        _iso(clock.t - timedelta(seconds=1)),
+        _iso(clock.t + timedelta(seconds=1)),
+    ).json()
+    by_key = {(g["tenant_id"], g["route_id"]): g for g in body["groups"]}
+    assert by_key[(None, None)]["consumed"] == 4.0
+    assert by_key[(None, None)]["decision_count"] == 1
+    assert by_key[("t1", None)]["consumed"] == 6.0
+    assert by_key[("t1", None)]["decision_count"] == 1
+    assert body["total_consumed"] == 10.0
+
+
+def test_usage_reservation_statuses_are_classified(client, clock):
+    put_policy(client, "global", 100, 0)
+    put_policy(client, "tenant", 100, 0, tenant="t1")
+    put_policy(client, "route", 100, 0, tenant="t1", route="/r1")
+
+    # confirmed：按预占量 cost 计入消耗
+    _reserve(client, "rsv-ok", 4, ttl=60)
+    client.post("/reservations/rsv-ok/confirm")
+    # settled：按 actual_cost 计入消耗（少用）
+    _reserve(client, "rsv-set", 5, ttl=60, tenant="t1")
+    client.post("/reservations/rsv-set/settle", json={"actual_cost": 2})
+    # 未到期 pending：只计入占用
+    _reserve(client, "rsv-hold", 7, ttl=60, tenant="t1", route="/r1")
+    # rejected：不计入
+    _reserve(client, "rsv-no", 999, ttl=60, tenant="t1")
+    # cancelled：不计入
+    _reserve(client, "rsv-cancel", 3, ttl=60)
+    client.post("/reservations/rsv-cancel/cancel")
+
+    body = _usage(
+        client,
+        _iso(clock.t - timedelta(seconds=10)),
+        _iso(clock.t + timedelta(seconds=10)),
+    ).json()
+    by_key = {(g["tenant_id"], g["route_id"]): g for g in body["groups"]}
+
+    g = by_key[(None, None)]
+    assert g["consumed"] == 4.0 and g["confirmed_count"] == 1
+    assert g["settled_count"] == 0 and g["pending_count"] == 0
+    g = by_key[("t1", None)]
+    assert g["consumed"] == 2.0 and g["settled_count"] == 1
+    assert g["confirmed_count"] == 0
+    g = by_key[("t1", "/r1")]
+    assert g["consumed"] == 0.0 and g["held"] == 7.0 and g["pending_count"] == 1
+    assert body["total_consumed"] == 6.0 and body["total_held"] == 7.0
+
+
+def test_usage_due_but_unswept_pending_counts_as_expired_without_mutation(client, clock):
+    put_policy(client, "global", 10, 0)
+    _reserve(client, "rsv-due", 3, ttl=60)
+    assert _db_global_balance_raw() == 7.0
+    clock.advance(61)  # 已到期但没有任何写操作触发惰性清扫
+
+    # 库里仍是 pending（尚未清扫）
+    assert _db_status("rsv-due") == "pending"
+
+    body = _usage(
+        client,
+        _iso(clock.t - timedelta(seconds=120)),
+        _iso(clock.t + timedelta(seconds=60)),
+    ).json()
+    # 到期（含未清扫）的 pending：既不计消耗也不计占用
+    assert body["groups"] == []
+    assert body["total_consumed"] == 0.0 and body["total_held"] == 0.0
+
+    # 查询是只读的：预占仍为 pending、桶仍未返还（余额 7）
+    assert _db_status("rsv-due") == "pending"
+    assert _db_global_balance_raw() == 7.0
+
+    # 对照：随后一次真正的写操作（查询单条预占）才惰性清扫并返还
+    client.get("/reservations/rsv-due")
+    assert _db_status("rsv-due") == "expired"
+    assert _db_global_balance_raw() == 10.0
+
+
+def test_usage_expired_and_cancelled_after_sweep_excluded(client, clock):
+    put_policy(client, "global", 100, 0)
+    _reserve(client, "rsv-e", 3, ttl=60)
+    clock.advance(61)
+    # 用一次裁决触发全局清扫，rsv-e 变为 expired
+    client.post("/decide", json={"request_id": "sweep", "cost": 1})
+    assert _db_status("rsv-e") == "expired"
+
+    body = _usage(
+        client,
+        _iso(clock.t - timedelta(seconds=120)),
+        _iso(clock.t + timedelta(seconds=60)),
+    ).json()
+    # 只剩触发清扫的那笔裁决；expired 预占不产生分组
+    assert [(g["tenant_id"], g["route_id"]) for g in body["groups"]] == [(None, None)]
+    assert body["groups"][0]["consumed"] == 1.0
+    assert body["groups"][0]["held"] == 0.0
+
+
+def test_usage_window_left_closed_right_open_decisions(client, clock):
+    put_policy(client, "global", 1000, 0)
+    t0 = clock.t
+    client.post("/decide", json={"request_id": "at-start", "cost": 1})
+    clock.advance(30)
+    client.post("/decide", json={"request_id": "middle", "cost": 10})
+    clock.advance(30)
+    t_end = clock.t  # 12:01:00
+    client.post("/decide", json={"request_id": "at-end", "cost": 100})
+
+    body = _usage(client, _iso(t0), _iso(t_end)).json()
+    by_id_cost = body["total_consumed"]
+    # 左闭：at-start 计入；右开：at-end（恰在 end）不计入
+    assert by_id_cost == 11.0
+    assert body["groups"][0]["decision_count"] == 2
+
+    # 把 end 推后则 at-end 计入
+    body2 = _usage(
+        client, _iso(t0), _iso(t_end + timedelta(seconds=1))
+    ).json()
+    assert body2["total_consumed"] == 111.0
+
+
+def test_usage_window_filters_reservations_by_created_at(client, clock):
+    put_policy(client, "global", 100, 0)
+    t0 = clock.t
+    _reserve(client, "rsv-before", 2, ttl=60)
+    clock.advance(30)
+    _reserve(client, "rsv-in", 3, ttl=60)
+
+    # 窗口起点在两笔预占之间：只统计 rsv-in
+    body = _usage(
+        client,
+        _iso(t0 + timedelta(seconds=10)),
+        _iso(t0 + timedelta(seconds=120)),
+    ).json()
+    assert body["total_held"] == 3.0
+    assert body["groups"][0]["pending_count"] == 1
+
+    # 窗口在创建之前：无匹配
+    empty = _usage(
+        client,
+        _iso(t0 - timedelta(seconds=60)),
+        _iso(t0 - timedelta(seconds=10)),
+    ).json()
+    assert empty["groups"] == []
+    assert empty["total_consumed"] == 0.0 and empty["total_held"] == 0.0
+
+
+def test_usage_no_matching_records_returns_empty_groups(client):
+    put_policy(client, "global", 10, 0)
+    body = _usage(
+        client, "2020-01-01T00:00:00Z", "2020-01-02T00:00:00Z"
+    ).json()
+    assert body["groups"] == []
+    assert body["total_consumed"] == 0.0 and body["total_held"] == 0.0
+
+
+def test_usage_validation_422(client):
+    put_policy(client, "global", 10, 0)
+
+    # 缺少参数
+    r = client.get("/quota-usage")
+    assert r.status_code == 422
+    r = client.get("/quota-usage", params={"start": "2026-09-27T12:00:00Z"})
+    assert r.status_code == 422
+
+    # 非法时间格式
+    assert _usage(client, "not-a-time", "2026-09-27T12:00:00Z").status_code == 422
+    assert _usage(client, "2026-09-27", "2026-09-27T12:00:00Z").status_code == 422
+    # 不带时区的时间无法可靠解释为 UTC
+    assert _usage(
+        client, "2026-09-27T12:00:00", "2026-09-27T13:00:00Z"
+    ).status_code == 422
+    # 起点不早于终点
+    assert _usage(
+        client, "2026-09-27T12:00:00Z", "2026-09-27T12:00:00Z"
+    ).status_code == 422
+    assert _usage(
+        client, "2026-09-27T13:00:00Z", "2026-09-27T12:00:00Z"
+    ).status_code == 422
+
+
+def test_usage_accepts_timezone_offsets_and_is_anonymous(client, clock):
+    put_policy(client, "global", 100, 0)
+    client.post("/decide", json={"request_id": "d-off", "cost": 5})
+    # 带非 UTC 偏移：12:00+08:00 == 04:00Z，20:00+08:00 == 12:00Z
+    r = _usage(client, "2026-09-27T20:00:00+08:00", "2026-09-28T00:00:00+08:00")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total_consumed"] == 5.0
+    # 回显统一为 UTC
+    assert body["start"] == "2026-09-27T12:00:00.000000Z"
+    assert body["end"] == "2026-09-27T16:00:00.000000Z"
+    # 免认证：无需任何签名头即可调用（本测试本身即匿名调用）
+
+
+def test_usage_evaluated_at_boundary_for_pending_hold(client, clock):
+    put_policy(client, "global", 100, 0)
+    _reserve(client, "rsv-b", 4, ttl=60)
+
+    # 到期前一刻：expire_at > evaluated_at，未到期 -> 计入占用
+    clock.advance(59)
+    body_before = _usage(
+        client,
+        _iso(clock.t - timedelta(seconds=120)),
+        _iso(clock.t + timedelta(seconds=60)),
+    ).json()
+    assert body_before["total_held"] == 4.0
+
+    # 恰好到期：expire_at == evaluated_at，按到期处理 -> 不计占用
+    clock.advance(1)
+    body_due = _usage(
+        client,
+        _iso(clock.t - timedelta(seconds=120)),
+        _iso(clock.t + timedelta(seconds=60)),
+    ).json()
+    assert body_due["total_held"] == 0.0
+    # 查询全程只读：预占仍为 pending（未被惰性清扫）
+    assert _db_status("rsv-b") == "pending"
+
+
+def test_usage_settled_actual_cost_counts_not_reserved_cost(client, clock):
+    put_policy(client, "global", 100, 0)
+    # 多用：预占 3，实际 8（补扣成功）
+    _reserve(client, "rsv-more", 3, ttl=60)
+    client.post("/reservations/rsv-more/settle", json={"actual_cost": 8})
+    # actual=0：全额返还，消耗计 0
+    _reserve(client, "rsv-zero", 2, ttl=60)
+    client.post("/reservations/rsv-zero/settle", json={"actual_cost": 0})
+
+    body = _usage(
+        client,
+        _iso(clock.t - timedelta(seconds=10)),
+        _iso(clock.t + timedelta(seconds=10)),
+    ).json()
+    g = body["groups"][0]
+    assert g["consumed"] == 8.0
+    assert g["settled_count"] == 2
+    assert g["held"] == 0.0

@@ -139,7 +139,8 @@
   `POST /policy-changes`（定时变更创建）、`DELETE /policy-changes/{change_id}`
   （定时变更取消）。**所有 GET、`POST /decide`、`POST /decide-batches` 裁决、
 `POST /policies/impact-preview` 预演、撤销、预占（`POST /reservations` 及其
-确认/取消/结算/查询）与 `POST /quota-plans` 配额规划接口保持原样、无需认证**。
+确认/取消/结算/查询）、`POST /quota-plans` 配额规划与 `GET /quota-usage` 消耗
+核对接口保持原样、无需认证**。
   客户端发送 `X-Key-Id`、`X-Timestamp`（Unix 秒）、`X-Nonce`、`X-Signature` 四个头，
   签名原文为 `方法\n原始路径及查询串\n请求体 SHA-256 十六进制\n时间戳\nnonce`，
   签名值为小写十六进制 HMAC-SHA256。服务端用 `ADMIN_KEY_ID` / `ADMIN_HMAC_SECRET`
@@ -352,6 +353,7 @@ print(urllib.request.urlopen(req).read().decode())
 | `POST` | `/reservations/{reservation_id}/settle` | 结算预占：仅未到期 pending→settled，按实际用量 actual_cost 多退少补（少用返还差额并封顶、多用原桶都足够才统一补扣，否则 409 保持 pending 不扣款）；同值重放、异值/其他终态 409、到期优先（先持久化 expired 与返还）、未知 ID 404、负数/NaN 422 |
 | `GET`  | `/reservations/{reservation_id}` | 查询预占状态与到期时间（settled 行含 actual_cost / settled_at）；该预占到期时在同一事务内清理为 expired 并返还 |
 | `POST` | `/quota-plans` | 只读规划：为 1～18 个待执行请求选出配额内总收益最大的子集（精确最优，同级并列比项数、再比升序 ID 字典序）；返回入选/未入选 ID、总收益与命中桶剩余额 |
+| `GET`  | `/quota-usage` | 只读消耗核对：按 UTC 左闭右开窗口（裁决时间 / 预占创建时间）在同一只读快照内按 tenant_id、route_id 汇总已消耗量与未完成占用量；不修改预占或桶 |
 | `GET`  | `/events` | 按 id 递增分页查询 low_balance 事件（`after_id` / `limit`） |
 
 策略对象：
@@ -1115,6 +1117,77 @@ curl -s -X POST http://localhost:8000/quota-plans \
 > - 校验：项数非 1～18、`item_id` 重复或为空、缺 `tenant_id`、只给 `route_id`
 >   不给 `tenant_id`、`cost <= 0`、`value` 为负或非整数，均返回 **422**。
 
+## 配额消耗核对（GET /quota-usage，免认证、只读）
+
+运营按租户与路由核对一段时间内配额请求的实际消耗时使用。输入 **UTC 起止时间
+（左闭右开 `[start, end)`）**：裁决按 `decided_at`、预占按 `created_at` 筛选；
+服务在**同一只读快照**内完成全部统计，按 `tenant_id`、`route_id` 汇总已消耗量
+与未完成占用量。接口只执行 `SELECT`：**不推进预占到期状态，也不修改任何预占或桶**。
+
+```bash
+curl -s -G 'http://localhost:8000/quota-usage' \
+  --data-urlencode 'start=2026-09-27T12:00:00Z' \
+  --data-urlencode 'end=2026-09-27T13:00:00Z'
+```
+
+时间参数必须是**显式带时区**的 ISO 8601 时间（`...Z` 或如 `...+08:00` 的偏移，
+非 UTC 偏移会换算为 UTC）；时间格式无效（含不带时区）或 `start >= end` 返回
+**422**。分组键取自裁决 / 预占请求自身携带的 `tenant_id` / `route_id`：只带
+租户的请求 `route_id` 为 `null`，两者都不带（全局级请求）均为 `null`。
+
+计量口径：
+
+- **已消耗量 `consumed`**
+  - 获准（`allowed=true`）且**未撤销**的单笔裁决与成功批次内的单笔裁决，按
+    `cost` 计入；**被拒绝或已撤销**的裁决不计入；
+  - `confirmed` 预占按**预占量 `cost`** 计入；
+  - `settled` 预占按**实际用量 `actual_cost`** 计入（`actual_cost=0` 仍产生
+    分组与计数，消耗贡献为 0）。
+- **未完成占用量 `held`**
+  - 报表快照时刻 `evaluated_at` **尚未到期**的 `pending` 预占，按预占量
+    `cost` 计入；
+  - **到期但尚未惰性清扫的 `pending` 也按到期处理**（只比较 `expire_at` 与
+    `evaluated_at`，不触发清扫、不返还、不改状态），不计入占用。
+- `rejected` / `cancelled` / `expired` 预占一律不计入；幂等重放不产生新行、
+  批次内每笔裁决各自以 `request_id` 存档，因此**重放与批次不会重复计量**。
+- **无匹配记录**（或窗口内只有不计入项）时 `groups` 为空列表。
+
+响应（分组按 全局 → 租户 → 路由、再按 id 升序排列；另附各类笔数便于对账）：
+
+```json
+{
+  "start": "2026-09-27T12:00:00.000000Z",
+  "end": "2026-09-27T13:00:00.000000Z",
+  "evaluated_at": "2026-09-28T22:58:28.984463Z",
+  "total_consumed": 16.5,
+  "total_held": 7.0,
+  "groups": [
+    {"tenant_id": null,   "route_id": null,         "consumed": 5.0, "held": 0.0,
+     "decision_count": 1, "confirmed_count": 0, "settled_count": 0, "pending_count": 0},
+    {"tenant_id": "acme", "route_id": null,         "consumed": 4.5, "held": 7.0,
+     "decision_count": 1, "confirmed_count": 0, "settled_count": 1, "pending_count": 1},
+    {"tenant_id": "acme", "route_id": "/v1/search", "consumed": 7.0, "held": 0.0,
+     "decision_count": 1, "confirmed_count": 1, "settled_count": 0, "pending_count": 0}
+  ]
+}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `start` / `end` | 实际使用的窗口边界（统一回显为带微秒的 UTC 文本，左闭右开） |
+| `evaluated_at` | 同一只读快照的报表时刻；到期 pending 是否计入占用以此为唯一依据 |
+| `groups[].consumed` | 该分组窗口内已消耗量（获准未撤销裁决 + confirmed 预占量 + settled 实际用量） |
+| `groups[].held` | 该分组在 `evaluated_at` 尚未到期的 pending 预占占用量 |
+| `groups[].decision_count` / `confirmed_count` / `settled_count` / `pending_count` | 分别计入 `consumed` / `held` 的各类笔数 |
+| `total_consumed` / `total_held` | 全部分组的合计 |
+
+> - 一次请求会同时命中全局 / 租户 / 路由多个**桶**，但核对按请求自身的
+>   `tenant_id` + `route_id` **一个分组**记账（例如带租户与路由的请求只计入
+>   `(acme, /v1/search)` 分组，不累加到全局 / 租户分组）；
+> - 窗口边界与库内时间均为 ISO 8601 UTC 文本，按字典序比较，恰在 `start` 的
+>   记录计入、恰在 `end` 的不计入；
+> - 查询全程只读，可安全反复调用；接口免认证。
+
 ## 行为约定与边界
 
 - 桶首次被命中时按当前容量**满额**创建。
@@ -1278,6 +1351,14 @@ rejected 存档、同 ID 同载荷重放（pending 与 rejected 两种存档）�
 未命中策略层的项恒可入选、无可行项返回空集、只读（不改桶/裁决/事件、
 不建桶）、不推进到期定时切换与到期预占、快照时刻统一补充、
 1～18 项与 item_id 唯一性等 422 校验、免认证，以及与暴力枚举对照的精确最优性。
+配额消耗核对覆盖：获准未撤销单笔及批次裁决计入消耗（拒绝/已撤销不计入）、
+批次内单笔按 request_id 各自计量且批次/单笔重放不重复计量、
+confirmed 按预占量与 settled 按 actual_cost（含 actual=0）计入消耗、
+未到期 pending 只计占用、rejected/cancelled/expired 不计入、
+到期但尚未惰性清扫的 pending 按到期处理且查询不修改预占或桶（只读直读库验证）、
+按 tenant_id+route_id 分组与全局/租户/路由排序、窗口按裁决/预占创建时间
+左闭右开筛选（含端点边界与 created_at 过滤）、无匹配返回空分组、
+时间格式无效（含不带时区）与起点不早于终点 422、非 UTC 偏移换算、免认证。
 
 ## 项目结构
 
@@ -1285,11 +1366,11 @@ rejected 存档、同 ID 同载荷重放（pending 与 rejected 两种存档）�
 app/
   auth.py       # 管理写接口 HMAC-SHA256 防重放：签名校验（常量时间比较）、时间窗与 nonce 登记
   database.py   # SQLite 连接、WAL/busy_timeout、BEGIN IMMEDIATE 写事务 / 只读快照事务、建表（含 admin_nonces、decide_batches、reservations[actual_cost/settled_at/settled]）与老库迁移（baseline 版本补登、老 reservations 表就地重建升级）
-  quota.py      # 策略 upsert、版本审计/回滚、定时切换登记/取消/到期应用、惰性补充、整组裁决、批量裁决（同刻切换+按序共享桶+全获准才落库+批次幂等存档）、策略影响预演（只读快照+现行/候选双侧内存演算）、配额预占（统一预扣/原桶快照/确认/取消/结算多退少补/到期惰性清扫返还）、配额规划（只读快照+分支限界精确最优子集）、幂等存档、撤销与低余额事件
-  schemas.py    # Pydantic 请求/响应模型（含批量裁决、影响预演、配额预占[结算]与配额规划）
-  main.py       # FastAPI 路由（4 个管理写接口挂载签名依赖，其余匿名，含 POST /decide-batches、POST /policies/impact-preview、/reservations 预占五接口[含 settle]与 POST /quota-plans）
+  quota.py      # 策略 upsert、版本审计/回滚、定时切换登记/取消/到期应用、惰性补充、整组裁决、批量裁决（同刻切换+按序共享桶+全获准才落库+批次幂等存档）、策略影响预演（只读快照+现行/候选双侧内存演算）、配额预占（统一预扣/原桶快照/确认/取消/结算多退少补/到期惰性清扫返还）、配额规划（只读快照+分支限界精确最优子集）、配额消耗核对（只读快照按窗口/租户/路由汇总消耗与占用）、幂等存档、撤销与低余额事件
+  schemas.py    # Pydantic 请求/响应模型（含批量裁决、影响预演、配额预占[结算]、配额规划与配额消耗核对）
+  main.py       # FastAPI 路由（4 个管理写接口挂载签名依赖，其余匿名，含 POST /decide-batches、POST /policies/impact-preview、/reservations 预占五接口[含 settle]、POST /quota-plans 与 GET /quota-usage）
 tests/
-  test_api.py   # 行为、并发与 HMAC 认证测试（含批量裁决、策略影响预演、配额预占与配额规划）
+  test_api.py   # 行为、并发与 HMAC 认证测试（含批量裁决、策略影响预演、配额预占、配额规划与配额消耗核对）
 Dockerfile
 docker-compose.yml
 ```

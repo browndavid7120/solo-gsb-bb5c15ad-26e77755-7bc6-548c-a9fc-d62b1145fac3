@@ -348,6 +348,46 @@ class QuotaPlanOut(BaseModel):
     )
 
 
+class UsageGroupOut(BaseModel):
+    """按 tenant_id + route_id 汇总的已消耗量与未完成占用量。
+
+    分组键取自裁决 / 预占请求自身携带的 tenant_id / route_id：
+    仅带 tenant_id 的请求 route_id 为 null，两者都不带（全局级请求）均为 null。
+    """
+
+    tenant_id: Optional[str] = Field(..., description="租户 ID；全局级分组为 null")
+    route_id: Optional[str] = Field(..., description="路由 ID；租户级 / 全局级分组为 null")
+    consumed: float = Field(
+        ...,
+        description=(
+            "已消耗量：窗口内获准且未撤销的单笔及批次裁决 cost 合计，"
+            "加 status=confirmed 预占的 cost、status=settled 预占的 actual_cost"
+        ),
+    )
+    held: float = Field(
+        ...,
+        description=(
+            "未完成占用量：status=pending 且在报表时刻（同一只读快照）尚未到期的"
+            "预占 cost 合计；已到期（含到期但尚未惰性清扫）的 pending 不计入"
+        ),
+    )
+    decision_count: int = Field(..., description="计入 consumed 的获准裁决笔数（不含被拒绝/已撤销）")
+    confirmed_count: int = Field(..., description="计入 consumed 的 confirmed 预占笔数")
+    settled_count: int = Field(..., description="计入 consumed 的 settled 预占笔数")
+    pending_count: int = Field(..., description="计入 held 的未到期 pending 预占笔数")
+
+
+class QuotaUsageOut(BaseModel):
+    start: str = Field(..., description="统计窗口起点（UTC，左闭）")
+    end: str = Field(..., description="统计窗口终点（UTC，右开）")
+    evaluated_at: str = Field(..., description="同一只读快照的报表时刻（ISO 8601 UTC）")
+    total_consumed: float = Field(..., description="全部分组已消耗量合计")
+    total_held: float = Field(..., description="全部分组未完成占用量合计")
+    groups: list[UsageGroupOut] = Field(
+        ..., description="按 tenant_id、route_id 汇总的分组（按范围全局→租户→路由排序）"
+    )
+
+
 class LowBalanceEventOut(BaseModel):
     id: int = Field(..., description="单调递增的事件 id，用作分页游标")
     scope: str
