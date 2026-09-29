@@ -3193,3 +3193,194 @@ def test_quota_plan_exact_optimum_brute_force_crosscheck(client):
         ("tenant", "t1", None): remaining[("tenant", "t1")],
         ("tenant", "t2", None): remaining[("tenant", "t2")],
     }
+
+
+# ------------------------------------------------------------ 消耗与占用核对（GET /consumption）
+
+
+def _report(client, start, end):
+    return client.get("/consumption", params={"start": start, "end": end})
+
+
+def _report_map(client, start, end):
+    body = _report(client, start, end).json()
+    return {
+        (g["tenant_id"], g["route_id"]): g
+        for g in body["groups"]
+    }
+
+
+def test_consumption_groups_decisions_and_reservations(client, clock):
+    put_policy(client, "global", 1000, 0)
+    put_policy(client, "tenant", 1000, 0, tenant="t1")
+    put_policy(client, "route", 1000, 0, tenant="t1", route="/r1")
+
+    # 裁决：t1/r1 获准 3、获准 2（随后撤销）；t1 获准 5；全局获准 9
+    client.post("/decide", json={"request_id": "d1", "tenant_id": "t1", "route_id": "/r1", "cost": 3})
+    client.post("/decide", json={"request_id": "d2", "tenant_id": "t1", "route_id": "/r1", "cost": 2})
+    client.post("/decide", json={"request_id": "d3", "tenant_id": "t1", "cost": 5})
+    client.post("/decide", json={"request_id": "d0", "cost": 9})
+    client.post("/decide/d2/revoke")
+    # 被拒绝的裁决不计入
+    client.post("/decide", json={"request_id": "d4", "tenant_id": "t1", "route_id": "/r1", "cost": 999999})
+
+    # 预占：r1 confirmed（计预占量 4）、r2 settled actual=6、r3 未到期 pending（占用 8）
+    client.post("/reservations", json={"reservation_id": "r1", "tenant_id": "t1", "route_id": "/r1", "cost": 4, "ttl_seconds": 300})
+    client.post("/reservations", json={"reservation_id": "r2", "tenant_id": "t1", "cost": 7, "ttl_seconds": 300})
+    client.post("/reservations", json={"reservation_id": "r3", "tenant_id": "t1", "route_id": "/r1", "cost": 8, "ttl_seconds": 300})
+    client.post("/reservations/r1/confirm")
+    client.post("/reservations/r2/settle", json={"actual_cost": 6})
+
+    start, end = "2026-09-27T11:00:00Z", "2026-09-27T13:00:00Z"
+    resp = _report(client, start, end)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["start_at"] == start
+    assert body["end_at"] == end
+    assert body["generated_at"].endswith("Z")
+
+    groups = {(g["tenant_id"], g["route_id"]): g for g in body["groups"]}
+    # 按键升序：空串（全局）在前，随后租户、路由
+    assert [(g["tenant_id"], g["route_id"]) for g in body["groups"]] == [
+        (None, None), ("t1", None), ("t1", "/r1"),
+    ]
+    # t1 无路由：裁决 d3=5 + settled r2 actual=6
+    assert groups[("t1", None)]["consumed"] == 11.0
+    assert groups[("t1", None)]["occupied"] == 0.0
+    # t1/r1：获准未撤销裁决 d1=3（d2 已撤销、d4 被拒）+ confirmed r1=4
+    assert groups[("t1", "/r1")]["consumed"] == 7.0
+    # 未到期 pending r3=8 只计占用
+    assert groups[("t1", "/r1")]["occupied"] == 8.0
+    # 全局：仅裁决 d0=9
+    assert groups[(None, None)]["consumed"] == 9.0
+    assert groups[(None, None)]["occupied"] == 0.0
+
+
+def test_consumption_due_unswept_pending_counts_as_expired_and_not_mutated(client, clock):
+    import sqlite3
+
+    put_policy(client, "global", 100, 0)
+    client.post("/reservations", json={"reservation_id": "r", "cost": 4, "ttl_seconds": 60})
+    # 时间推进到到期之后；不触发任何余额写操作，r 仍为未惰性清扫的 pending
+    clock.advance(90)
+
+    resp = _report(client, "2026-09-27T11:00:00Z", "2026-09-27T13:00:00Z")
+    assert resp.status_code == 200
+    # 到期 pending 按到期处理：既不消耗也不占用 -> 空分组
+    assert resp.json()["groups"] == []
+
+    # 只读：报告不改预占状态，也不返还桶
+    con = sqlite3.connect(os.environ["QUOTA_DB_PATH"])
+    assert con.execute("SELECT status FROM reservations").fetchone()[0] == "pending"
+    assert con.execute("SELECT balance FROM buckets").fetchone()[0] == 96.0
+    con.close()
+
+
+def test_consumption_batch_decisions_count_once_and_failed_batch_counts_nothing(client):
+    put_policy(client, "global", 100, 0)
+    # 成功批次：两笔 4+6 写入 decisions，共消耗 10
+    r = client.post("/decide-batches", json={
+        "batch_id": "b1",
+        "requests": [
+            {"request_id": "bd1", "cost": 4},
+            {"request_id": "bd2", "cost": 6},
+        ],
+    })
+    assert r.json()["committed"] is True
+    # 批次重放不重复计量
+    assert client.post("/decide-batches", json={
+        "batch_id": "b1",
+        "requests": [
+            {"request_id": "bd1", "cost": 4},
+            {"request_id": "bd2", "cost": 6},
+        ],
+    }).json()["replayed"] is True
+    # 失败批次：桶余 90，再来一笔 95 整批失败，不写 decisions
+    r = client.post("/decide-batches", json={
+        "batch_id": "b2",
+        "requests": [{"request_id": "bd3", "cost": 95}],
+    })
+    assert r.json()["committed"] is False
+
+    groups = _report_map(client, "2000-01-01T00:00:00Z", "2100-01-01T00:00:00Z")
+    assert groups[(None, None)]["consumed"] == 10.0
+    assert groups[(None, None)]["occupied"] == 0.0
+
+
+def test_consumption_window_is_half_open_and_filters_by_time(client, clock):
+    put_policy(client, "global", 100, 0)
+    # clock 起点 2026-09-27T12:00:00Z
+    client.post("/decide", json={"request_id": "a", "cost": 2})   # 12:00:00
+    clock.advance(10)
+    client.post("/decide", json={"request_id": "b", "cost": 3})   # 12:00:10
+    clock.advance(10)
+    client.post("/decide", json={"request_id": "c", "cost": 5})   # 12:00:20
+
+    def consumed(start, end):
+        g = _report_map(client, start, end)
+        return g.get((None, None), {}).get("consumed", 0.0)
+
+    # 左闭：起点恰为 a 的时刻，a 计入
+    assert consumed("2026-09-27T12:00:00Z", "2026-09-27T12:00:10Z") == 2.0
+    # 右开：终点恰为 b 的时刻，b 不计入
+    assert consumed("2026-09-27T12:00:10Z", "2026-09-27T12:00:20Z") == 3.0
+    # 完整窗口
+    assert consumed("2026-09-27T12:00:00Z", "2026-09-27T12:00:21Z") == 10.0
+    # 不相交窗口为空
+    assert consumed("2026-09-28T00:00:00Z", "2026-09-29T00:00:00Z") == 0.0
+
+
+def test_consumption_excludes_rejected_cancelled_expired_reservations(client, clock):
+    put_policy(client, "global", 1000, 0)
+    # rejected（桶不足）
+    client.post("/reservations", json={"reservation_id": "rj", "cost": 999999, "ttl_seconds": 300})
+    # cancelled
+    client.post("/reservations", json={"reservation_id": "cc", "cost": 4, "ttl_seconds": 300})
+    client.post("/reservations/cc/cancel")
+    # expired：推进时间并由下一次写操作惰性清扫
+    client.post("/reservations", json={"reservation_id": "ex", "cost": 7, "ttl_seconds": 60})
+    clock.advance(90)
+    client.post("/decide", json={"request_id": "trigger", "cost": 1})
+    assert client.get("/reservations/ex").json()["status"] == "expired"
+
+    body = _report(client, "2026-09-27T11:00:00Z", "2026-09-27T13:00:00Z").json()
+    # 三个预占全部不计；只有清扫后那笔裁决 trigger=1
+    groups = {(g["tenant_id"], g["route_id"]): g for g in body["groups"]}
+    assert groups[(None, None)]["consumed"] == 1.0
+    assert groups[(None, None)]["occupied"] == 0.0
+
+
+def test_consumption_empty_groups(client):
+    body = _report(client, "2026-09-27T11:00:00Z", "2026-09-27T13:00:00Z").json()
+    assert body["groups"] == []
+
+
+def test_consumption_validation_errors(client):
+    base = "2026-09-27T11:00:00Z"
+    later = "2026-09-27T13:00:00Z"
+    # 格式无效
+    assert _report(client, "not-a-time", later).status_code == 422
+    assert _report(client, base, "2026/09/27 11:00").status_code == 422
+    # 不带时区
+    assert _report(client, "2026-09-27T11:00:00", later).status_code == 422
+    # 起点不早于终点
+    assert _report(client, later, base).status_code == 422
+    assert _report(client, base, base).status_code == 422
+    # 缺少参数
+    assert client.get("/consumption", params={"start": base}).status_code == 422
+
+
+def test_consumption_accepts_offset_and_normalizes_to_utc(client, clock):
+    put_policy(client, "global", 100, 0)
+    client.post("/decide", json={"request_id": "d", "cost": 1})
+    # +08:00 偏移等价的同一时刻窗口应能查到
+    body = _report(client, "2026-09-27T19:00:00+08:00", "2026-09-27T21:00:00+08:00").json()
+    assert body["start_at"] == "2026-09-27T11:00:00Z"
+    assert body["end_at"] == "2026-09-27T13:00:00Z"
+    groups = {(g["tenant_id"], g["route_id"]): g for g in body["groups"]}
+    assert groups[(None, None)]["consumed"] == 1.0
+
+
+def test_consumption_remains_anonymous(client):
+    r = _report(client, "2026-09-27T11:00:00Z", "2026-09-27T13:00:00Z")
+    assert r.status_code == 200

@@ -9,7 +9,8 @@ DELETE /policy-changes/{change_id}）需要 HMAC-SHA256 防重放签名
 （X-Key-Id/X-Timestamp/X-Nonce/X-Signature，见 app/auth.py）；
 所有 GET、POST /decide、POST /decide-batches 裁决与撤销、
 POST /policies/impact-preview 预演、POST /reservations 预占
-（含确认/取消/结算/查询）与 POST /quota-plans 配额规划接口保持匿名可用。
+（含确认/取消/结算/查询）、POST /quota-plans 配额规划与
+GET /consumption 消耗核对接口保持匿名可用。
 """
 
 from __future__ import annotations
@@ -17,9 +18,10 @@ from __future__ import annotations
 import math
 import sqlite3
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, Iterator
 
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -28,6 +30,7 @@ from .auth import AdminPrincipal, require_admin, reserve_nonce
 from .database import connect, init_db, read_tx, write_tx
 from .schemas import (
     BucketOut,
+    ConsumptionReportOut,
     DecideBatchIn,
     DecideBatchOut,
     DecideIn,
@@ -79,11 +82,16 @@ app = FastAPI(
         "POST /quota-plans 在只读快照上为 1～18 个待执行请求规划配额内总收益最大的"
         "子集：同一时刻按现行策略补充各命中桶（未建桶按满额），不推进定时变更与"
         "预占状态，精确求最优（总收益最大、项数更多、升序 ID 字典序更小），全程只读。"
+        "GET /consumption 在同一只读快照内按 tenant_id、route_id 汇总 UTC 半开区间"
+        "[start, end) 的配额实际消耗与未完成占用：裁决按 decided_at、预占按 created_at"
+        "筛选；获准未撤销裁决计 cost、confirmed 计预占量、settled 计 actual_cost，"
+        "未到期 pending 只计占用；拒绝/撤销裁决与 rejected/cancelled/expired 预占、"
+        "到期未清扫的 pending 均不计入；不推进预占到期、不改动任何预占或桶。"
         "管理写接口（策略新增/更新、回滚、定时变更创建/取消）需要"
         " HMAC-SHA256 防重放签名（X-Key-Id/X-Timestamp/X-Nonce/X-Signature）；"
         "GET、裁决（含批量）、预演、撤销、预占与配额规划接口无需认证。"
     ),
-    version="1.9.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -127,6 +135,29 @@ async def _validation_exception_handler(
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+def _parse_utc_window_param(value: str, name: str) -> datetime:
+    """解析 ISO 8601 UTC 时间查询参数；必须显式带时区，否则按 422 校验错误处理。
+
+    接受 'Z' 后缀或任意显式 UTC 偏移（统一换算到 UTC）。
+    """
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        raise HTTPException(
+            422,
+            f"{name} 时间格式无效：{value!r}，请使用 ISO 8601 UTC 时间"
+            "（如 2026-09-27T12:00:00Z）",
+        )
+    if dt.tzinfo is None:
+        raise HTTPException(
+            422, f"{name} 必须显式带 UTC 时区（如 2026-09-27T12:00:00Z）"
+        )
+    return dt.astimezone(timezone.utc)
 
 
 # ---------------------------------------------------------------- 策略
@@ -372,6 +403,46 @@ def get_events(
     `after_id` 继续翻页，直到返回空列表。
     """
     return quota.list_events(conn, after_id=after_id, limit=limit)
+
+
+# ------------------------------------------------------------ 消耗与占用核对
+
+
+@app.get(
+    "/consumption",
+    response_model=ConsumptionReportOut,
+    tags=["消耗核对"],
+    responses={
+        422: {"description": "start/end 时间格式无效、缺少时区，或起点不早于终点"},
+    },
+)
+def get_consumption(
+    start: str = Query(
+        ...,
+        description="窗口起点（含），ISO 8601 UTC 时间，如 2026-09-27T00:00:00Z",
+    ),
+    end: str = Query(
+        ...,
+        description="窗口终点（不含），ISO 8601 UTC 时间，如 2026-09-28T00:00:00Z",
+    ),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict:
+    """按 tenant_id、route_id 核对半开区间 [start, end) 的配额实际消耗与未完成占用。
+
+    裁决按 decided_at 筛选、预占按 created_at 筛选；同一只读快照事务内汇总，
+    全程只读：不推进预占到期、不惰性清扫、不改动任何预占或桶。
+    - consumed：获准且未撤销的单笔及成功批次裁决 cost；confirmed 预占按预占量、
+      settled 预占按 actual_cost。
+    - occupied：窗口内创建且尚未到期（expire_at 晚于快照时刻）的 pending 预占量。
+    被拒绝/已撤销裁决与 rejected/cancelled/expired 预占均不计入；到期但尚未
+    惰性清扫的 pending 也按到期处理。无匹配记录时 groups 为空列表。免认证。
+    """
+    start_dt = _parse_utc_window_param(start, "start")
+    end_dt = _parse_utc_window_param(end, "end")
+    if start_dt >= end_dt:
+        raise HTTPException(422, "start 必须早于 end（半开区间 [start, end)，两端不可相等）")
+    with read_tx(conn):
+        return quota.consumption_report(conn, start=start_dt, end=end_dt)
 
 
 # ---------------------------------------------------------------- 裁决 / 撤销

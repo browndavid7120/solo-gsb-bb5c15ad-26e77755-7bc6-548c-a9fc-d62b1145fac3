@@ -358,3 +358,29 @@ class LowBalanceEventOut(BaseModel):
     threshold: float = Field(..., description="触发本事件时的低余额阈值")
     request_id: str = Field(..., description="触发本事件的裁决 request_id")
     created_at: str
+
+
+class ConsumptionGroupOut(BaseModel):
+    tenant_id: Optional[str] = Field(default=None, description="租户 ID；全局级（无租户）为 null")
+    route_id: Optional[str] = Field(default=None, description="路由 ID；非路由级为 null")
+    consumed: float = Field(
+        ...,
+        description="已消耗量：[start_at, end_at) 内获准且未撤销的裁决（含成功批次中的单笔）cost 之和，"
+        "加 confirmed 预占的预占量、settled 预占的 actual_cost",
+    )
+    occupied: float = Field(
+        ...,
+        description="未完成占用量：[start_at, end_at) 内创建且尚未到期的 pending 预占的预占量之和；"
+        "已到期（含到期但尚未惰性清扫）的 pending 按到期处理，不计入",
+    )
+
+
+class ConsumptionReportOut(BaseModel):
+    start_at: str = Field(..., description="窗口起点（含，ISO 8601 UTC）")
+    end_at: str = Field(..., description="窗口终点（不含，ISO 8601 UTC）")
+    generated_at: str = Field(
+        ..., description="核对快照时刻（ISO 8601 UTC）；pending 是否到期以该时刻判定"
+    )
+    groups: list[ConsumptionGroupOut] = Field(
+        ..., description="按 tenant_id、route_id 汇总的消耗与占用分组（按键升序）；无匹配记录为空列表"
+    )

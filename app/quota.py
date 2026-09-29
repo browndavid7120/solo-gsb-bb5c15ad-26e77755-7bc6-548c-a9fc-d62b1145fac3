@@ -2553,3 +2553,104 @@ def settle_reservation(
         (reservation_id,),
     ).fetchone()
     return _reservation_out(conn, row, replayed=False, now=ts)
+
+
+# ------------------------------------------------------------ 消耗与占用核对（只读）
+
+
+def consumption_report(
+    conn: sqlite3.Connection,
+    *,
+    start: datetime,
+    end: datetime,
+) -> dict[str, Any]:
+    """在调用方提供的只读快照事务内，按 (tenant_id, route_id) 汇总半开区间
+    [start, end) 的配额实际消耗与未完成占用。
+
+    已消耗量 consumed：
+      - decisions 中 allowed=1 且 revoked=0、decided_at 落在窗口内的裁决 cost 之和。
+        成功批次的每笔裁决在提交时已作为普通行写入 decisions（decided_at 为批次
+        时刻），重放不新增行、失败批次整批回滚不写行，故批次存档天然不重不漏；
+      - reservations 中 created_at 落在窗口内者：confirmed 按预占量 cost 计，
+        settled 按 actual_cost 计。
+    未完成占用 occupied：created_at 落在窗口内、status=pending 且 expire_at 晚于
+    快照时刻的预占 cost 之和（尚未到期）。status 仍为 pending 但 expire_at 已到
+    （到期但尚未惰性清扫）按到期处理，不计入；rejected/cancelled/expired 也不计入。
+
+    仅执行 SELECT，绝不推进预占到期状态、不修改任何桶或预占行。无匹配记录时
+    groups 返回空列表。
+    """
+    start_iso = iso(start)
+    end_iso = iso(end)
+    # 快照时刻只取一次：同一事务内的多条 SELECT 共用同一 expire_at 边界
+    now_iso = iso(now_utc())
+
+    groups: dict[tuple[str, str], dict[str, float]] = {}
+
+    def bucket(tenant: str, route: str) -> dict[str, float]:
+        key = (tenant, route)
+        grp = groups.get(key)
+        if grp is None:
+            grp = {"consumed": 0.0, "occupied": 0.0}
+            groups[key] = grp
+        return grp
+
+    # 1) 裁决（含成功批次中的单笔）：获准且未撤销，按裁决时间落窗。
+    #    decisions 表不单独存 tenant_id/route_id 列（在 payload_json 内），
+    #    用 JSON1 解出；无该键（null）时按空串归一，与 reservations 存储约定一致。
+    decision_rows = conn.execute(
+        """
+        SELECT COALESCE(json_extract(payload_json, '$.tenant_id'), '') AS tenant_id,
+               COALESCE(json_extract(payload_json, '$.route_id'), '')  AS route_id,
+               SUM(cost) AS total
+        FROM decisions
+        WHERE allowed = 1 AND revoked = 0
+          AND decided_at >= ? AND decided_at < ?
+        GROUP BY tenant_id, route_id
+        """,
+        (start_iso, end_iso),
+    ).fetchall()
+    for r in decision_rows:
+        bucket(r["tenant_id"], r["route_id"])["consumed"] += float(r["total"] or 0.0)
+
+    # 2) 预占：按创建时间落窗。confirmed 计预占量、settled 计 actual_cost；
+    #    仅未到期 pending（expire_at > 快照时刻）计占用。WHERE 先把
+    #    rejected/cancelled/expired 以及到期未清扫的 pending 全部排除。
+    reservation_rows = conn.execute(
+        """
+        SELECT tenant_id, route_id,
+               SUM(CASE WHEN status = 'confirmed' THEN cost
+                        WHEN status = 'settled' THEN actual_cost
+                        ELSE 0 END) AS consumed_total,
+               SUM(CASE WHEN status = 'pending' THEN cost ELSE 0 END)
+                   AS occupied_total
+        FROM reservations
+        WHERE created_at >= ? AND created_at < ?
+          AND (
+                status IN ('confirmed', 'settled')
+                OR (status = 'pending' AND expire_at > ?)
+              )
+        GROUP BY tenant_id, route_id
+        """,
+        (start_iso, end_iso, now_iso),
+    ).fetchall()
+    for r in reservation_rows:
+        grp = bucket(r["tenant_id"], r["route_id"])
+        grp["consumed"] += float(r["consumed_total"] or 0.0)
+        grp["occupied"] += float(r["occupied_total"] or 0.0)
+
+    ordered = [
+        {
+            "tenant_id": tenant or None,
+            "route_id": route or None,
+            "consumed": values["consumed"],
+            "occupied": values["occupied"],
+        }
+        for (tenant, route), values in sorted(groups.items())
+    ]
+    return {
+        "start_at": start_iso,
+        "end_at": end_iso,
+        "generated_at": now_iso,
+        "groups": ordered,
+    }

@@ -352,6 +352,7 @@ print(urllib.request.urlopen(req).read().decode())
 | `POST` | `/reservations/{reservation_id}/settle` | 结算预占：仅未到期 pending→settled，按实际用量 actual_cost 多退少补（少用返还差额并封顶、多用原桶都足够才统一补扣，否则 409 保持 pending 不扣款）；同值重放、异值/其他终态 409、到期优先（先持久化 expired 与返还）、未知 ID 404、负数/NaN 422 |
 | `GET`  | `/reservations/{reservation_id}` | 查询预占状态与到期时间（settled 行含 actual_cost / settled_at）；该预占到期时在同一事务内清理为 expired 并返还 |
 | `POST` | `/quota-plans` | 只读规划：为 1～18 个待执行请求选出配额内总收益最大的子集（精确最优，同级并列比项数、再比升序 ID 字典序）；返回入选/未入选 ID、总收益与命中桶剩余额 |
+| `GET`  | `/consumption` | 只读核对：在同一只读快照内按 `tenant_id`、`route_id` 汇总 `[start, end)` 的已消耗量与未完成占用量（裁决按 `decided_at`、预占按 `created_at` 筛选） |
 | `GET`  | `/events` | 按 id 递增分页查询 low_balance 事件（`after_id` / `limit`） |
 
 策略对象：
@@ -1115,6 +1116,50 @@ curl -s -X POST http://localhost:8000/quota-plans \
 > - 校验：项数非 1～18、`item_id` 重复或为空、缺 `tenant_id`、只给 `route_id`
 >   不给 `tenant_id`、`cost <= 0`、`value` 为负或非整数，均返回 **422**。
 
+## 消耗与占用核对（GET /consumption，免认证、只读）
+
+供运营按租户、路由核对一段时间内配额请求的**实际消耗**与**未完成占用**。
+传入 UTC 起止时间（**左闭右开** `[start, end)`）：裁决按 `decided_at` 落窗、
+预占按 `created_at` 落窗；整个核对在**同一只读快照事务**内完成，不推进预占到期、
+不惰性清扫、不创建桶、不写任何数据。
+
+```bash
+curl -s -G 'http://localhost:8000/consumption' \
+  --data-urlencode 'start=2026-09-27T00:00:00Z' \
+  --data-urlencode 'end=2026-09-28T00:00:00Z'
+```
+
+```json
+{
+  "start_at": "2026-09-27T00:00:00Z",
+  "end_at": "2026-09-28T00:00:00Z",
+  "generated_at": "2026-09-28T03:14:15.123456Z",
+  "groups": [
+    {"tenant_id": null,     "route_id": null,    "consumed": 12.0, "occupied": 0.0},
+    {"tenant_id": "acme",  "route_id": null,    "consumed": 7.0,  "occupied": 0.0},
+    {"tenant_id": "acme",  "route_id": "/v1/search", "consumed": 9.0, "occupied": 4.0}
+  ]
+}
+```
+
+计量口径：
+
+> - **consumed（已消耗量）**：窗口内 `allowed` 且未 `revoked` 的裁决 `cost` 之和
+>   （成功批次中的每笔裁决在提交时已作为普通裁决存档，天然不重不漏；重放与批次
+>   存档均不重复计量），加上 `confirmed` 预占的**预占量 `cost`** 与 `settled`
+>   预占的**实际用量 `actual_cost`**；
+> - **occupied（未完成占用量）**：窗口内创建、`status=pending` 且 `expire_at`
+>   **晚于快照时刻**（尚未到期）的预占 `cost` 之和；
+> - 被**拒绝**的裁决、已**撤销**的裁决，以及预占的 `rejected` / `cancelled` /
+>   `expired` 一律不计入；`pending` 预占**已到期但尚未被惰性清扫**的，按到期处理
+>   （既不计消耗也不计占用），查询本身不会把它转成 `expired`、也不返还桶；
+> - 分组键为存储时的 `(tenant_id, route_id)`：无租户的全局请求两个字段均为
+>   `null`，仅有租户的请求 `route_id` 为 `null`；分组按键升序返回。窗口内**无任何
+>   匹配记录**时 `groups` 为空列表 `[]`；
+> - `start` / `end` 必须是 ISO 8601 且**显式带时区**的时间（接受 `Z` 或如
+>   `+08:00` 的偏移，统一按 UTC 比较与回显）；时间格式无法解析、不带时区，或
+>   `start` 不早于 `end`（含相等），均返回 **422**；缺少任一参数返回 **422**。
+
 ## 行为约定与边界
 
 - 桶首次被命中时按当前容量**满额**创建。
@@ -1200,6 +1245,19 @@ curl -s -X POST http://localhost:8000/quota-plans \
     字典序（小者胜）；`selected_item_ids` / `unselected_item_ids` 均按升序返回；
   - 响应 `buckets` 为本次规划命中的全部桶（含仅被未入选项命中的桶）扣除入选项
     占用后的剩余额；无可行项时 `selected_item_ids` 为空、总收益为 0。
+- 消耗与占用核对（`GET /consumption`）的额外约定：
+  - 全程在 `read_tx` 只读快照内执行多条 `SELECT`：不应用到期定时切换、不把到期
+    pending 预占惰性转 `expired`、不返还桶、不创建桶、不写裁决与事件；同一响应内
+    各汇总共用同一快照时刻（`generated_at`）判定 pending 是否到期；
+  - 窗口为左闭右开：裁决按 `decided_at`、预占按 `created_at` 落窗；成功批次的
+    单笔裁决与普通裁决共用 `decisions` 存档（提交时刻为批次时刻），故重放与批次
+    档案均不会重复计量，失败批次不写裁决也就不计入；
+  - `consumed = 获准且未撤销裁决的 cost 之和 + confirmed 预占的 cost 之和
+    + settled 预占的 actual_cost 之和`；`occupied` 只统计窗口内创建且
+    `expire_at > 快照时刻` 的 pending 预占 cost；其余状态与到期未清扫的 pending
+    一律不计；分组为 `(tenant_id, route_id)`，无匹配记录返回空分组列表；
+  - `start` / `end` 必须为显式带时区的 ISO 8601 时间（接受 `Z` / 偏移量），
+    无法解析、不带时区或 `start >= end` 返回 422。
 
 ## 本地开发（不用 Docker）
 
